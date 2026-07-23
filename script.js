@@ -15,8 +15,8 @@
 ────────────────────────────────────────────────────────────────── */
 const CONFIG = {
   // ← Replace with your deployed backend URL (see /server/server.js), e.g.
-  //    "https://omicron-backend.onrender.com/api/chat"
-  API_URL:  "https://YOUR-RENDER-APP.onrender.com/api/chat",
+  //    "https://omicron-1.onrender.com"
+  API_URL:  "https://omicron-1.onrender.com",
   TIMEOUT_MS: 30_000,
   MAX_RETRIES: 1,
 };
