@@ -38,6 +38,20 @@ const path = require("path");
 /* ── Configuration ─────────────────────────────────────────────── */
 const PORT = 4477;
 const TOKEN = "omicron-local-4477"; // ← must match COMPANION_TOKEN in script.js
+// SECURITY: since this server is now reachable from other devices on your
+// Wi-Fi (not just this laptop), it's worth changing TOKEN to a random string
+// of your own — just make sure to update the matching value in script.js too.
+
+function getLanIps() {
+  const nets = os.networkInterfaces();
+  const ips = [];
+  for (const name of Object.keys(nets)) {
+    for (const net of nets[name]) {
+      if (net.family === "IPv4" && !net.internal) ips.push(net.address);
+    }
+  }
+  return ips;
+}
 
 // Detect Desktop path (handles OneDrive-redirected Desktop, common on Windows)
 function detectDesktopPath() {
@@ -123,12 +137,50 @@ function createDesktopItem(params, kind) {
   });
 }
 
+/* ── Static file serving (so phones/other devices can load the app) ── */
+const MIME_TYPES = {
+  ".html": "text/html",
+  ".js":   "text/javascript",
+  ".css":  "text/css",
+  ".png":  "image/png",
+  ".jpg":  "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".svg":  "image/svg+xml",
+  ".ico":  "image/x-icon",
+  ".json": "application/json",
+};
+
+function serveStatic(req, res) {
+  let reqPath = decodeURIComponent(req.url.split("?")[0]);
+  if (reqPath === "/") reqPath = "/index.html";
+
+  // Prevent path traversal outside this folder.
+  const filePath = path.normalize(path.join(__dirname, reqPath));
+  if (!filePath.startsWith(__dirname)) {
+    res.writeHead(403); res.end("Forbidden"); return;
+  }
+  // Don't serve this server's own source file to the network.
+  if (path.basename(filePath) === "companion-server.js") {
+    res.writeHead(403); res.end("Forbidden"); return;
+  }
+
+  fs.readFile(filePath, (err, data) => {
+    if (err) { res.writeHead(404); res.end("Not found"); return; }
+    const ext = path.extname(filePath).toLowerCase();
+    res.writeHead(200, { "Content-Type": MIME_TYPES[ext] || "application/octet-stream" });
+    res.end(data);
+  });
+}
+
 /* ── HTTP server ───────────────────────────────────────────────── */
 const server = http.createServer((req, res) => {
   // CORS: allow the local page (file:// origin sends "null")
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-OMICRON-Token");
   res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
+  // Chrome's Private Network Access: required for a public HTTPS site
+  // (like GitHub Pages) to be allowed to reach localhost/private IPs.
+  res.setHeader("Access-Control-Allow-Private-Network", "true");
 
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
@@ -167,13 +219,25 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (req.method === "GET") {
+    serveStatic(req, res);
+    return;
+  }
+
   res.writeHead(404, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ ok: false, error: "Not found." }));
 });
 
-server.listen(PORT, "127.0.0.1", () => {
+server.listen(PORT, "0.0.0.0", () => {
+  const lanIps = getLanIps();
   console.log(`\n  OMICRON Companion Server running`);
-  console.log(`  → http://localhost:${PORT}`);
+  console.log(`  → On this laptop:   http://localhost:${PORT}`);
+  if (lanIps.length > 0) {
+    lanIps.forEach((ip) => console.log(`  → From your phone:  http://${ip}:${PORT}  (same Wi-Fi)`));
+  } else {
+    console.log(`  → No LAN IP detected. Make sure Wi-Fi is connected to see a phone URL here.`);
+  }
   console.log(`  → Desktop path: ${DESKTOP_PATH}`);
-  console.log(`  Leave this window open while using OMICRON.\n`);
+  console.log(`\n  Leave this window open while using OMICRON.`);
+  console.log(`  If your phone can't connect, check Windows Firewall isn't blocking Node.js.\n`);
 });
