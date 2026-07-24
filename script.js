@@ -48,12 +48,13 @@ const STORAGE = {
    3. DEFAULT SETTINGS
 ────────────────────────────────────────────────────────────────── */
 const DEFAULT_SETTINGS = {
-  theme:       "dark",
-  model:       "openai/gpt-4o-mini",
-  temperature: 0.7,
-  maxTokens:   4096,
-  agentMode:   false,
-  webSearch:   false,
+  theme:        "dark",
+  model:        "openai/gpt-4o-mini",
+  temperature:  0.7,
+  maxTokens:    4096,
+  agentMode:    false,
+  webSearch:    false,
+  companionUrl: detectDefaultCompanionUrl(),
 };
 
 /* ─────────────────────────────────────────────────────────────────
@@ -117,6 +118,7 @@ const DOM = {
   modelSelect:         document.getElementById("modelSelect"),
   agentModeToggle:     document.getElementById("agentModeToggle"),
   webSearchToggle:     document.getElementById("webSearchToggle"),
+  companionUrlInput:   document.getElementById("companionUrlInput"),
   temperatureSlider:   document.getElementById("temperatureSlider"),
   temperatureValue:    document.getElementById("temperatureValue"),
   maxTokensSlider:     document.getElementById("maxTokensSlider"),
@@ -1037,13 +1039,24 @@ const AGENT_TOOLS = [
   },
 ];
 
+/**
+ * Work out a sensible default companion server URL based on how this page
+ * was loaded. Covers three real deployment cases:
+ *  - Opened as a local file (file://)              → localhost:4477
+ *  - Served BY the companion server itself           → same origin
+ *    (covers phone-over-LAN, since companion-server.js serves the app too)
+ *  - Served from anywhere else (e.g. GitHub Pages)    → localhost:4477
+ *    (works when browser + companion server are on the same laptop;
+ *     browsers exempt localhost from HTTPS "mixed content" blocking)
+ */
+function detectDefaultCompanionUrl() {
+  if (location.protocol === "file:") return "http://localhost:4477";
+  if (location.port === "4477") return location.origin;
+  return "http://localhost:4477";
+}
+
 /** Companion server connection info — TOKEN must match companion-server.js */
 const COMPANION = {
-  // If this page was opened as a local file (file://), the companion server
-  // must be reached at localhost. If this page was served BY the companion
-  // server itself (e.g. loaded on a phone via http://<laptop-ip>:4477),
-  // use the same origin the page was loaded from — no manual config needed.
-  URL: location.protocol === "file:" ? "http://localhost:4477" : location.origin,
   TOKEN: "omicron-local-4477",
 };
 
@@ -1067,7 +1080,7 @@ const ToolRunner = {
   /** Send a command to the local companion server. */
   async _companionCall(action, params) {
     try {
-      const res = await fetch(`${COMPANION.URL}/command`, {
+      const res = await fetch(`${state.settings.companionUrl}/command`, {
         method:  "POST",
         headers: {
           "Content-Type":     "application/json",
@@ -1650,6 +1663,7 @@ const SettingsUI = {
     // Agent toggles
     DOM.agentModeToggle.checked = !!state.settings.agentMode;
     DOM.webSearchToggle.checked = !!state.settings.webSearch;
+    DOM.companionUrlInput.value = state.settings.companionUrl || detectDefaultCompanionUrl();
 
     // Sliders
     DOM.temperatureSlider.value = state.settings.temperature;
@@ -1667,6 +1681,7 @@ const SettingsUI = {
     state.settings.model       = DOM.modelSelect.value;
     state.settings.agentMode   = DOM.agentModeToggle.checked;
     state.settings.webSearch   = DOM.webSearchToggle.checked;
+    state.settings.companionUrl = DOM.companionUrlInput.value.trim().replace(/\/+$/, "") || detectDefaultCompanionUrl();
     state.settings.temperature = parseFloat(DOM.temperatureSlider.value);
     state.settings.maxTokens   = parseInt(DOM.maxTokensSlider.value, 10);
 
