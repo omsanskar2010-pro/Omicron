@@ -1,0 +1,21 @@
+{
+  "name": "omicron-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Backend proxy that keeps the OpenRouter API key server-side for OMICRON.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "docx": "^9.0.2",
+    "exceljs": "^4.4.0",
+    "express": "^4.19.2",
+    "mammoth": "^1.8.0",
+    "pptxgenjs": "^3.12.0"
+  }
+}
