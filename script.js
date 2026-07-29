@@ -1574,16 +1574,19 @@ const AgentClient = {
   MAX_STEPS: 6,
 
   /**
-   * Run the agent loop: call the model, execute any requested tools,
-   * feed results back, repeat until a final text answer is produced.
+   * Run the agent loop with real token streaming: call the model, stream
+   * text live via onChunk, and if it requests tool calls, execute them and
+   * loop. This matches normal chat's streaming speed/feel instead of
+   * waiting silently for a full non-streamed completion each step.
    * @param {Message[]} history - prior chat messages (excludes empty placeholder)
    * @param {object} opts
-   * @param {function(string):void} opts.onStep - called with a human-readable status line
+   * @param {function(string):void} opts.onChunk - called with each text fragment
+   * @param {function(string):void} opts.onStep - called with a tool-status line
    * @param {AbortSignal} opts.signal
    * @returns {Promise<string>} final answer text
    */
-  async run(history, { onStep, signal }) {
-    let systemPrompt = SYSTEM_PROMPT + AGENT_SYSTEM_ADDENDUM + MemoryManager.buildContextBlock();
+  async run(history, { onChunk, onStep, signal }) {
+    const systemPrompt = SYSTEM_PROMPT + AGENT_SYSTEM_ADDENDUM + MemoryManager.buildContextBlock();
     let convo = [
       { role: "system", content: systemPrompt },
       ...history.map(toApiMessage),
@@ -1600,31 +1603,70 @@ const AgentClient = {
         temperature: state.settings.temperature,
         max_tokens:  state.settings.maxTokens,
         tools:       AGENT_TOOLS,
+        stream:      true,
       };
 
       const response = await fetch(CONFIG.API_URL, {
         method:  "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body:   JSON.stringify(payload),
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify(payload),
         signal,
       });
 
       if (!response.ok) {
-        const err = await ApiClient._handleHttpError(response);
-        throw err;
+        throw await ApiClient._handleHttpError(response);
       }
 
-      const data = await response.json();
-      const msg  = data.choices?.[0]?.message;
-      if (!msg) throw new Error("The model returned an empty response.");
+      // Stream and accumulate both plain text and tool-call fragments.
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let content = "";
+      const toolCallsAcc = []; // sparse array indexed by the delta's tool_call index
 
-      const toolCalls = msg.tool_calls;
+      streamLoop: while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-      if (toolCalls && toolCalls.length > 0) {
-        // Record the assistant's tool-call turn, then execute each tool.
-        convo.push(msg);
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const data = line.slice(6).trim();
+          if (data === "[DONE]") break streamLoop;
+
+          let json;
+          try { json = JSON.parse(data); } catch { continue; }
+
+          const delta = json.choices?.[0]?.delta;
+          if (!delta) continue;
+
+          if (delta.content) {
+            content += delta.content;
+            onChunk?.(delta.content);
+          }
+
+          if (delta.tool_calls) {
+            for (const fragment of delta.tool_calls) {
+              const i = fragment.index ?? 0;
+              if (!toolCallsAcc[i]) {
+                toolCallsAcc[i] = { id: fragment.id, type: "function", function: { name: "", arguments: "" } };
+              }
+              const call = toolCallsAcc[i];
+              if (fragment.id) call.id = fragment.id;
+              if (fragment.function?.name) call.function.name += fragment.function.name;
+              if (fragment.function?.arguments) call.function.arguments += fragment.function.arguments;
+            }
+          }
+        }
+      }
+
+      const toolCalls = toolCallsAcc.filter(Boolean);
+
+      if (toolCalls.length > 0) {
+        convo.push({ role: "assistant", content: content || null, tool_calls: toolCalls });
 
         for (const call of toolCalls) {
           const fnName = call.function?.name ?? "unknown_tool";
@@ -1643,8 +1685,8 @@ const AgentClient = {
         continue; // loop back for the model's next move
       }
 
-      // No tool calls → this is the final answer.
-      return msg.content ?? "";
+      // No tool calls → the streamed content is the final answer.
+      return content;
     }
 
     throw new Error("Agent stopped after too many steps without a final answer.");
@@ -2120,23 +2162,38 @@ const Composer = {
     if (isLive()) MessagesUI.setTyping(false);
 
     let stepLog = "";
+    let answerText = "";
+
+    const renderLive = () => {
+      if (!isLive()) return;
+      if (!contentEl) {
+        msgEl = MessagesUI.getOrCreateMessageEl(placeholderMsg);
+        contentEl = msgEl.querySelector(".message__content");
+      }
+      const stepHtml = stepLog ? `<div class="agent-steps">${escapeHtml(stepLog)}</div>` : "";
+      contentEl.innerHTML =
+        stepHtml + MarkdownRenderer.render(answerText) + `<span class="streaming-cursor" aria-hidden="true"></span>`;
+      contentEl.querySelectorAll(".code-copy-btn").forEach((btn) => {
+        btn.addEventListener("click", () => MessagesUI.copyCode(btn));
+      });
+      MessagesUI.scrollToBottom(false);
+    };
+
     const onStep = (line) => {
       stepLog += `🔧 ${line}\n`;
-      if (isLive()) {
-        if (!contentEl) {
-          msgEl = MessagesUI.getOrCreateMessageEl(placeholderMsg);
-          contentEl = msgEl.querySelector(".message__content");
-        }
-        contentEl.innerHTML =
-          `<div class="agent-steps">${escapeHtml(stepLog)}</div><span class="streaming-cursor" aria-hidden="true"></span>`;
-        MessagesUI.scrollToBottom(false);
-      }
+      renderLive();
+    };
+
+    const onChunk = (chunk) => {
+      answerText += chunk;
+      ChatManager.updateLastAssistantMessage(chat.id, answerText);
+      renderLive();
     };
 
     try {
       const finalText = await AgentClient.run(
         chat.messages.slice(0, -1), // exclude empty placeholder
-        { onStep, signal: abortController.signal },
+        { onChunk, onStep, signal: abortController.signal },
       );
       state.streamingChats.delete(chat.id);
       Composer._finishStream(chat.id, placeholderMsg.id, finalText);
@@ -2168,6 +2225,10 @@ const Composer = {
       const errText = `⚠️ ${error.message}`;
       ChatManager.updateLastAssistantMessage(chatId, errText);
       if (state.activeChatId === chatId) Toast.error(error.message);
+    } else {
+      // Persist the final answer — without this, it renders fine right now
+      // but disappears on reload since it was never saved to chat data.
+      ChatManager.updateLastAssistantMessage(chatId, content || "_No response._");
     }
 
     if (state.activeChatId !== chatId) return; // background chat — data already saved, nothing to render
