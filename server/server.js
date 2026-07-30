@@ -127,8 +127,53 @@ app.post("/api/admin/set-github-token", requireAdmin, (req, res) => {
   res.json({ ok: true, maskedToken: `${currentGithubToken.slice(0, 6)}…${currentGithubToken.slice(-4)}` });
 });
 
+/** Live OpenRouter balance, for the frontend's credit indicator. */
+app.get("/api/credits", async (req, res) => {
+  if (!currentApiKey) {
+    res.status(500).json({ error: "No API key configured." });
+    return;
+  }
+  try {
+    const r = await fetch("https://openrouter.ai/api/v1/credits", {
+      headers: { "Authorization": `Bearer ${currentApiKey}` },
+    });
+    const data = await r.json();
+    if (!r.ok) { res.status(r.status).json({ error: data }); return; }
+    const total = data.data?.total_credits ?? null;
+    const used  = data.data?.total_usage ?? null;
+    res.json({ ok: true, total, used, remaining: total !== null && used !== null ? total - used : null });
+  } catch (err) {
+    console.error("[OMICRON backend] Credits check error:", err);
+    res.status(502).json({ error: "Failed to reach OpenRouter." });
+  }
+});
+
 app.get("/api/health", (req, res) => {
   res.json({ ok: true, hasKey: !!currentApiKey });
+});
+
+/** Live OpenRouter account balance, for the UI's balance chip. No secrets exposed. */
+app.get("/api/credits", async (req, res) => {
+  if (!currentApiKey) {
+    res.status(500).json({ error: "No API key configured." });
+    return;
+  }
+  try {
+    const upstream = await fetch("https://openrouter.ai/api/v1/credits", {
+      headers: { "Authorization": `Bearer ${currentApiKey}` },
+    });
+    const data = await upstream.json();
+    if (!upstream.ok) {
+      res.status(upstream.status).json({ error: data?.error?.message || "Failed to fetch balance." });
+      return;
+    }
+    const total = data.data?.total_credits ?? 0;
+    const totalUsage = data.data?.total_usage ?? 0;
+    res.json({ ok: true, remaining: total - totalUsage, total, totalUsage });
+  } catch (err) {
+    console.error("[OMICRON backend] Balance check error:", err);
+    res.status(502).json({ error: "Couldn't reach OpenRouter." });
+  }
 });
 
 app.post("/api/chat", async (req, res) => {
@@ -333,6 +378,21 @@ app.post("/api/docs/word", async (req, res) => {
 });
 
 /** Extract plain text from an uploaded .docx so the model can propose edits. */
+const pdfParse = require("pdf-parse");
+
+/** Extract text from an uploaded PDF. */
+app.post("/api/docs/pdf-extract", async (req, res) => {
+  try {
+    const { base64 } = req.body || {};
+    if (!base64) return res.status(400).json({ error: "Missing 'base64' file content." });
+    const result = await pdfParse(Buffer.from(base64, "base64"));
+    res.json({ ok: true, text: result.text, pages: result.numpages });
+  } catch (err) {
+    console.error("[OMICRON backend] PDF extract error:", err);
+    res.status(500).json({ error: "Failed to read that PDF. Is it a valid, non-scanned PDF?" });
+  }
+});
+
 app.post("/api/docs/word-extract", async (req, res) => {
   try {
     const { base64 } = req.body || {};
