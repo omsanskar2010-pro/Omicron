@@ -86,6 +86,8 @@ const DOM = {
   // Top nav
   topNav:              document.getElementById("topNav"),
   modelBadgeName:      document.getElementById("modelBadgeName"),
+  creditBadge:         document.getElementById("creditBadge"),
+  creditBadgeText:     document.getElementById("creditBadgeText"),
   themeToggleBtn:      document.getElementById("themeToggleBtn"),
 
   // Chat
@@ -559,14 +561,21 @@ const ChatManager = {
   },
 
   /**
-   * Get sorted chats by updatedAt descending.
+   * Get sorted chats by updatedAt descending. Matches against the chat
+   * title AND full message content, so search finds chats by what was
+   * actually discussed, not just how they're named.
    * @param {string} [query]
    * @returns {Chat[]}
    */
   getChats(query = "") {
     const q    = query.toLowerCase().trim();
     const arr  = [...state.chats.values()];
-    const filtered = q ? arr.filter(c => c.title.toLowerCase().includes(q)) : arr;
+    const filtered = q
+      ? arr.filter((c) =>
+          c.title.toLowerCase().includes(q) ||
+          c.messages.some((m) => m.content.toLowerCase().includes(q)),
+        )
+      : arr;
     return filtered.sort((a, b) => b.updatedAt - a.updatedAt);
   },
 
@@ -783,15 +792,57 @@ const MessagesUI = {
         btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg> Copied`;
         setTimeout(() => { btn.innerHTML = orig; }, 2000);
       });
+      wrapper.querySelector("[data-action='edit']")?.addEventListener("click", () => {
+        MessagesUI._enterEditMode(wrapper, msg);
+      });
     }
 
     DOM.messages.appendChild(wrapper);
     return wrapper;
   },
 
-  /** Minimal action row for user messages: just copy. */
+  /** Replace a user message bubble with an inline editable textarea. */
+  _enterEditMode(wrapper, msg) {
+    const bubble = wrapper.querySelector(".message__bubble");
+    const original = bubble.innerHTML;
+    bubble.innerHTML = /* html */`
+      <textarea class="edit-message-textarea" style="width:100%; min-height:60px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.15); border-radius:8px; padding:8px; color:inherit; font-family:inherit; font-size:inherit; resize:vertical;">${escapeHtml(msg.content)}</textarea>
+      <div style="display:flex; gap:8px; margin-top:8px;">
+        <button class="btn btn--primary" data-edit-save style="padding:6px 14px; font-size:0.85rem;">Save &amp; Resend</button>
+        <button class="btn btn--ghost" data-edit-cancel style="padding:6px 14px; font-size:0.85rem;">Cancel</button>
+      </div>`;
+
+    const textarea = bubble.querySelector("textarea");
+    textarea.focus();
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+
+    bubble.querySelector("[data-edit-cancel]").addEventListener("click", () => {
+      bubble.innerHTML = original;
+    });
+
+    bubble.querySelector("[data-edit-save]").addEventListener("click", async () => {
+      const newText = textarea.value.trim();
+      if (!newText) return;
+      const chat = ChatManager.getActiveChat();
+      if (!chat || isChatStreaming(chat.id)) {
+        Toast.warning("Please wait for the current reply to finish before editing.");
+        return;
+      }
+      await Composer.editAndResend(chat.id, msg.id, newText);
+    });
+  },
+
+  /** Minimal action row for user messages: edit + copy. */
   _userActions(msg) {
     return /* html */`
+      <button class="message__action-btn" data-action="edit" aria-label="Edit message">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+          <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+        </svg>
+        Edit
+      </button>
       <button class="message__action-btn" data-action="copy-text" aria-label="Copy message text">
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
              stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1698,7 +1749,7 @@ const AgentClient = {
 ────────────────────────────────────────────────────────────────── */
 const FileAttachment = {
   MAX_SIZE_BYTES: 5 * 1024 * 1024, // 5 MB — enough for typical Office docs
-  BINARY_EXTENSIONS: { docx: "word", xlsx: "excel" },
+  BINARY_EXTENSIONS: { docx: "word", xlsx: "excel", pdf: "pdf" },
 
   /** Open the native file picker. */
   open() {
@@ -1741,6 +1792,11 @@ const FileAttachment = {
           .map((s) => `Sheet "${s.name}":\n` + s.rows.map((r) => `Row ${r.row}: ${JSON.stringify(r.values)}`).join("\n"))
           .join("\n\n");
         state.pendingAttachment = { name: file.name, kind, base64, content: summary };
+      } else if (kind === "pdf") {
+        const base64 = await FileAttachment._readAsBase64(file);
+        const result = await ToolRunner._backendCall("/api/docs/pdf-extract", { base64 });
+        if (result.error) { Toast.error(result.error); return; }
+        state.pendingAttachment = { name: file.name, kind, content: result.text };
       } else {
         // Try reading as text; if it's actually binary, fall back gracefully.
         try {
@@ -1941,8 +1997,127 @@ const VoiceOutput = {
 };
 
 /* ─────────────────────────────────────────────────────────────────
-   14d. MEMORY  ("remember this" → persists forever across sessions)
+   14e. CREDIT TRACKER
 ────────────────────────────────────────────────────────────────── */
+/** Polls and displays the live OpenRouter balance in the top bar. */
+const CreditTracker = {
+  async refresh() {
+    try {
+      const res = await fetch(`${CONFIG.BACKEND_URL}/api/credits`);
+      const data = await res.json();
+      if (!res.ok || data.remaining === null || data.remaining === undefined) {
+        DOM.creditBadgeText.textContent = "💳 —";
+        DOM.creditBadge.title = "Balance unavailable";
+        return;
+      }
+      const remaining = data.remaining;
+      DOM.creditBadgeText.textContent = `💳 $${remaining.toFixed(2)}`;
+      DOM.creditBadge.title = `OpenRouter balance: $${remaining.toFixed(2)} remaining of $${data.total.toFixed(2)}`;
+      if (remaining < 0.5) {
+        DOM.creditBadgeText.style.color = "#f87171";
+        if (remaining <= 0) Toast.warning("Your OpenRouter balance is at $0 — requests may fail until topped up.");
+      } else {
+        DOM.creditBadgeText.style.color = "";
+      }
+    } catch {
+      DOM.creditBadgeText.textContent = "💳 —";
+    }
+  },
+
+  start() {
+    CreditTracker.refresh();
+    setInterval(CreditTracker.refresh, 5 * 60 * 1000); // every 5 minutes
+    DOM.creditBadge.addEventListener("click", () => CreditTracker.refresh());
+  },
+};
+
+/** Quick text commands, handled instantly with no API call. */
+const SlashCommands = {
+  COMMANDS: {
+    help:      "Show this list of commands",
+    model:     "/model &lt;name&gt; — switch AI model (partial match, e.g. /model claude)",
+    agent:     "/agent on|off — toggle Agent Mode",
+    websearch: "/websearch on|off — toggle Web Search",
+    clear:     "/clear — clear messages in the current chat",
+    new:       "/new — start a new chat",
+    incognito: "/incognito — start an incognito chat (not saved)",
+  },
+
+  parse(text) {
+    const trimmed = text.trim();
+    if (!trimmed.startsWith("/")) return null;
+    const [cmd, ...rest] = trimmed.slice(1).split(/\s+/);
+    if (!cmd) return null;
+    return { cmd: cmd.toLowerCase(), args: rest.join(" ") };
+  },
+
+  /** @returns {Promise<string|null>} reply text, or null if nothing to show */
+  async handle({ cmd, args }) {
+    switch (cmd) {
+      case "help":
+        return Object.entries(SlashCommands.COMMANDS)
+          .map(([k, v]) => `**/${k}** — ${v}`)
+          .join("\n");
+
+      case "model": {
+        const q = args.toLowerCase().trim();
+        if (!q) return "Usage: /model <name>, e.g. /model claude";
+        const options = [...DOM.modelSelect.options];
+        const match = options.find(
+          (o) => o.value.toLowerCase().includes(q) || o.text.toLowerCase().includes(q),
+        );
+        if (!match) return `No model matches "${args}". Check Settings for the full list.`;
+        state.settings.model = match.value;
+        Storage.saveSettings();
+        DOM.modelSelect.value = match.value;
+        SettingsUI.updateModelBadge();
+        return `Switched model to **${match.text}**.`;
+      }
+
+      case "agent": {
+        const arg = args.trim().toLowerCase();
+        if (arg !== "on" && arg !== "off") return "Usage: /agent on  or  /agent off";
+        state.settings.agentMode = arg === "on";
+        Storage.saveSettings();
+        SettingsUI.updateModelBadge();
+        return `Agent Mode turned **${arg}**.`;
+      }
+
+      case "websearch": {
+        const arg = args.trim().toLowerCase();
+        if (arg !== "on" && arg !== "off") return "Usage: /websearch on  or  /websearch off";
+        state.settings.webSearch = arg === "on";
+        Storage.saveSettings();
+        return `Web Search turned **${arg}**.`;
+      }
+
+      case "clear": {
+        const chat = ChatManager.getActiveChat();
+        if (!chat) return null;
+        chat.messages = [];
+        Storage.saveChats();
+        MessagesUI.renderAll();
+        Toast.info("Chat cleared.");
+        return null;
+      }
+
+      case "new":
+        ChatManager.createChat();
+        DOM.messageInput.focus();
+        return null;
+
+      case "incognito":
+        ChatManager.createChat(true);
+        Toast.info("Incognito chat started — won't be saved.");
+        DOM.messageInput.focus();
+        return null;
+
+      default:
+        return `Unknown command "/${cmd}". Type /help to see available commands.`;
+    }
+  },
+};
+
 const MemoryManager = {
   STORAGE_KEY: "alpha_memory",
 
@@ -2036,6 +2211,36 @@ const Composer = {
       return;
     }
 
+    // Handle slash commands instantly, no API call.
+    if (text.startsWith("/")) {
+      const parsed = SlashCommands.parse(text);
+      if (parsed) {
+        DOM.messageInput.value = "";
+        Composer.autoResize();
+        Composer.updateCounter();
+
+        // These reset/change context entirely — don't clutter history with them.
+        if (["clear", "new", "incognito"].includes(parsed.cmd)) {
+          Composer.setSendEnabled(false);
+          await SlashCommands.handle(parsed);
+          return;
+        }
+
+        const userMsg = ChatManager.addMessage("user", text);
+        MessagesUI.appendMessage(userMsg);
+        Composer.setSendEnabled(false);
+
+        const reply = await SlashCommands.handle(parsed);
+        if (reply) {
+          const assistantMsg = ChatManager.addMessage("assistant", reply);
+          MessagesUI.appendMessage(assistantMsg);
+          MessagesUI.scrollToBottom();
+        }
+        Composer.setSendEnabled(DOM.messageInput.value.trim().length > 0);
+        return;
+      }
+    }
+
     // Fold in any attached (non-image) file as text context
     const attachmentBlock = FileAttachment.buildContextBlock();
     const fullText = attachmentBlock ? `${attachmentBlock}${text}` : text;
@@ -2063,6 +2268,32 @@ const Composer = {
   },
 
   /** Regenerate the last assistant response. */
+  /**
+   * Edit a past user message: remove it and everything after it, then
+   * resend the edited text as a fresh message.
+   * @param {string} chatId
+   * @param {string} msgId
+   * @param {string} newText
+   */
+  async editAndResend(chatId, msgId, newText) {
+    const chat = state.chats.get(chatId);
+    if (!chat) return;
+    const idx = chat.messages.findIndex((m) => m.id === msgId);
+    if (idx === -1) return;
+
+    chat.messages.splice(idx); // remove this message and everything after it
+    Storage.saveChats();
+    if (state.activeChatId === chatId) MessagesUI.renderAll();
+
+    const userMsg = ChatManager.addMessage("user", newText);
+    if (state.activeChatId === chatId) {
+      MessagesUI.appendMessage(userMsg);
+      MessagesUI.scrollToBottom();
+    }
+
+    await Composer._doStream(chat);
+  },
+
   async regenerate() {
     const chat = ChatManager.getActiveChat();
     if (!chat || isChatStreaming(chat.id) || chat.messages.length === 0) return;
@@ -2766,6 +2997,8 @@ const App = {
 
     // 11. Focus textarea
     DOM.messageInput.focus();
+
+    CreditTracker.start();
 
     console.info("[OMICRON] Initialized successfully. Ready for Om. 🚀");
   },
