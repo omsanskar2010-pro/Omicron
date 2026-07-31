@@ -130,6 +130,9 @@ const DOM = {
   webSearchToggle:     document.getElementById("webSearchToggle"),
   companionUrlInput:   document.getElementById("companionUrlInput"),
   openAdminPanelBtn:   document.getElementById("openAdminPanelBtn"),
+  exportBackupBtn:     document.getElementById("exportBackupBtn"),
+  importBackupBtn:     document.getElementById("importBackupBtn"),
+  backupFileInput:     document.getElementById("backupFileInput"),
   temperatureSlider:   document.getElementById("temperatureSlider"),
   temperatureValue:    document.getElementById("temperatureValue"),
   maxTokensSlider:     document.getElementById("maxTokensSlider"),
@@ -2172,6 +2175,107 @@ const MemoryManager = {
 };
 
 /* ─────────────────────────────────────────────────────────────────
+   14f. BACKUP / RESTORE
+   Everything lives only in this browser's localStorage — export it
+   to a portable file so clearing browser data or switching devices
+   doesn't mean losing everything.
+────────────────────────────────────────────────────────────────── */
+const BackupManager = {
+  FORMAT_VERSION: 1,
+
+  /** Gather everything into one JSON object and trigger a download. */
+  export() {
+    try {
+      // Exclude incognito chats deliberately — that's the whole point of them.
+      const chatsToBackup = [...state.chats].filter(([, chat]) => !chat.incognito);
+
+      const backup = {
+        formatVersion: BackupManager.FORMAT_VERSION,
+        exportedAt: new Date().toISOString(),
+        chats: Object.fromEntries(chatsToBackup),
+        settings: state.settings,
+        memory: MemoryManager.load(),
+      };
+
+      const json = JSON.stringify(backup, null, 2);
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      const dateStr = new Date().toISOString().slice(0, 10);
+      a.href = url;
+      a.download = `omicron-backup-${dateStr}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+
+      Toast.success(`Backup exported: ${chatsToBackup.length} chat(s), ${MemoryManager.load().length} memory item(s).`);
+    } catch (e) {
+      console.warn("[OMICRON] Backup export failed:", e);
+      Toast.error("Failed to export backup.");
+    }
+  },
+
+  /** Open the file picker for restoring a backup. */
+  openImportPicker() {
+    DOM.backupFileInput.value = "";
+    DOM.backupFileInput.click();
+  },
+
+  /**
+   * Restore from a selected backup file. Merges chats (keeping both old
+   * and imported, imported wins on ID collision) rather than wiping
+   * existing data, so importing is safe to do more than once.
+   * @param {File} file
+   */
+  async importFile(file) {
+    try {
+      const text = await file.text();
+      const backup = JSON.parse(text);
+
+      if (!backup || typeof backup !== "object" || !backup.chats) {
+        Toast.error("That doesn't look like a valid OMICRON backup file.");
+        return;
+      }
+
+      const importedCount = Object.keys(backup.chats).length;
+
+      const confirmed = window.confirm(
+        `Import ${importedCount} chat(s)${backup.memory ? ` and ${backup.memory.length} memory item(s)` : ""}?\n\n` +
+        `This will merge with your current chats (imported versions win on conflicts) ` +
+        `and REPLACE your current settings and memory.`,
+      );
+      if (!confirmed) return;
+
+      // Merge chats: imported entries overwrite any existing chat with the same ID.
+      for (const [id, chat] of Object.entries(backup.chats)) {
+        state.chats.set(id, chat);
+      }
+      Storage.saveChats();
+
+      if (backup.settings) {
+        state.settings = { ...DEFAULT_SETTINGS, ...backup.settings };
+        Storage.saveSettings();
+        ThemeManager.apply(state.settings.theme);
+      }
+
+      if (Array.isArray(backup.memory)) {
+        MemoryManager.save(backup.memory);
+      }
+
+      SidebarUI.renderChatList();
+      MessagesUI.renderAll();
+      SettingsUI.updateModelBadge();
+
+      Toast.success(`Restored ${importedCount} chat(s) from backup.`);
+    } catch (e) {
+      console.warn("[OMICRON] Backup import failed:", e);
+      Toast.error("Couldn't read that backup file — it may be corrupted or not valid JSON.");
+    }
+  },
+};
+
+/* ─────────────────────────────────────────────────────────────────
    15. COMPOSER
 ────────────────────────────────────────────────────────────────── */
 const Composer = {
@@ -2907,6 +3011,13 @@ const Events = {
 
     DOM.openAdminPanelBtn.addEventListener("click", () => {
       window.open(`${CONFIG.BACKEND_URL}/admin.html`, "_blank", "noopener");
+    });
+
+    DOM.exportBackupBtn.addEventListener("click", () => BackupManager.export());
+    DOM.importBackupBtn.addEventListener("click", () => BackupManager.openImportPicker());
+    DOM.backupFileInput.addEventListener("change", (e) => {
+      const file = e.target.files?.[0];
+      if (file) BackupManager.importFile(file);
     });
 
     DOM.settingsModalOverlay.addEventListener("click", (e) => {
